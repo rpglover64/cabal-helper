@@ -32,11 +32,13 @@ import System.IO
 import System.Exit
 import Text.ParserCombinators.ReadP
 
-data Panic = Panic String deriving (Typeable, Show)
+import CabalHelper.Error
+
+data Panic = Panic ChError deriving (Typeable, Show)
 instance Exception Panic
 
-panic :: String -> a
-panic msg = throw $ Panic msg
+panic :: ChError -> a
+panic = throw . Panic
 
 handlePanic :: IO a -> IO a
 handlePanic action =

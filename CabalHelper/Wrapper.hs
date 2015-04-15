@@ -74,6 +74,7 @@ globalArgSpec =
 
       , option "" ["with-cabal"] "cabal-install executable to use" $
                reqArg "PROG" $ \p o -> o { cabalProgram = p }
+      , option "" ["mi"] "machine interface" NoArg
       ]
  where
    option :: [Char] -> [String] -> String -> ArgDescr a -> OptDescr a
@@ -115,17 +116,11 @@ main = handlePanic $ do
       cfgf <- canonicalizePath (distdir </> "setup-config")
       mhdr <- getCabalConfigHeader cfgf
       case mhdr of
-        Nothing -> panic $ printf "\
-\Could not read Cabal's persistent setup configuration header\n\
-\- Check first line of: %s\n\
-\- Maybe try: $ cabal configure" cfgf
+        Nothing -> panic $ ChErrorSetupConfigHeader cfgf
         Just (hdrCabalVersion, (_compilerName, hdrCompilerVersion)) -> do
           ghcVer <- ghcVersion opts
           if not $ ghcVer `sameMajorVersionAs` hdrCompilerVersion
-            then panic $ printf "\
-\GHC major version changed! (was %s, now %s)\n\
-\- Reconfigure the project: $ cabal clean && cabal configure\
-\ " (showVersion hdrCompilerVersion) (showVersion ghcVer)
+            then panic $ ChErrorGhcVersion hdrCompilerVersion ghcVer
             else do
               eexe <- compileHelper opts hdrCabalVersion distdir
               case eexe of
@@ -293,9 +288,7 @@ callProcessStderr mwd exe args = do
 
 processFailedException :: String -> String -> [String] -> Int -> IO a
 processFailedException fn exe args rv =
-      panic $ concat [fn, ": ", exe, " "
-                     , intercalate " " (map show args)
-                     , " (exit " ++ show rv ++ ")"]
+      panic $ ChProcess fn exe args rv
 
 installCabal :: Options -> Version -> IO FilePath
 installCabal opts ver = do

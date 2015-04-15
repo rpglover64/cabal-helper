@@ -103,21 +103,22 @@ type MonadQuery m = ( MonadIO m
                     , MonadState (Maybe SomeLocalBuildInfo) m
                     , MonadReader (Programs, FilePath) m)
 
-run r s action = flip runReaderT r (flip evalStateT s (unQuery action))
+run r s action =
+    try $ evaluate $ flip runReaderT r (flip evalStateT s (unQuery action))
 
 -- | @runQuery query distdir@. Run a 'Query'. @distdir@ is where Cabal's
 -- @setup-config@ file is located.
 runQuery :: Monad m
          => FilePath -- ^ Path to @dist/@
          -> Query m a
-         -> m a
+         -> m (Either ChError a)
 runQuery fp action = run (def, fp) Nothing action
 
 runQuery' :: Monad m
          => Programs
          -> FilePath -- ^ Path to @dist/@
          -> Query m a
-         -> m a
+         -> m (Either ChError a)
 runQuery' progs fp action = run (progs, fp) Nothing action
 
 getSlbi :: MonadQuery m => m SomeLocalBuildInfo
@@ -192,7 +193,12 @@ getSomeConfigState = ask >>= \(progs, distdir) -> do
 
   res <- liftIO $ do
     exe  <- findLibexecExe "cabal-helper-wrapper"
-    out <- readProcess exe (distdir:args) ""
+    (rv, out, err) <- readProcessWithExitCode exe (distdir:args) ""
+    let msgs = map read $ lines out
+
+    evaluate msgs `E.catch`
+
+
     evaluate (read out) `E.catch` \(SomeException _) ->
       error $ concat ["getSomeConfigState", ": ", exe, " "
                      , intercalate " " (map show $ distdir:args)
@@ -298,3 +304,171 @@ getExecutablePath' =
 #else
     getProgName
 #endif
+
+chErrorMessage (ChErrorSetupConfigHeader cfgf) = printf "\
+\Could not read Cabal's persistent setup configuration header\n\
+\- Check first line of: %s\n\
+\- Maybe try: $ cabal configure" cfgf
+
+chErrorMessage (ChErrorGhcVersion lbiVer exeVer) = printf "\
+\GHC major version changed! (was %s, now %s)\n\
+\- Please reconfigure the project: $ cabal clean && cabal configure\
+\ " (sver lbiVer) (sver exeVer)
+
+chErrorMessage (ChErrorInstallCabalLibrary ver) = printf "\
+\Installing Cabal version %s failed.\n\
+\\n\
+\You have the following choices to fix this:\n\
+\\n\
+\- The easiest way to try and fix this is just reconfigure the project and try\n\
+\  again:\n\
+\        $ cabal clean && cabal configure\n\
+\\n\
+\- If that fails you can try to install the version of Cabal mentioned above\n\
+\  into your global/user package-db somehow, you'll probably have to fix\n\
+\  something otherwise it wouldn't have failed above:\n\
+\        $ cabal install Cabal --constraint 'Cabal == %s'\n\
+\\n\
+\- If you're using `Build-Type: Simple`:\n\
+\  - You can see if you can reinstall your cabal-install executable while\n\
+\    having it linked to a version of Cabal that's available in you\n\
+\    package-dbs or can be built automatically:\n\
+\        $ ghc-pkg list | grep Cabal  # find an available Cabal version\n\
+\        $ cabal install cabal-install --constraint 'Cabal == $the_found_version'\n\
+\    Afterwards you'll have to reconfigure your project:\n\
+\        $ cabal clean && cabal configure\n\
+\\n\
+\- If you're using `Build-Type: Custom`:\n\
+\  - Have cabal-install rebuild your Setup.hs executable with a version of the\n\
+\    Cabal library that you have available in your global/user package-db:\n\
+\        $ cabal clean && cabal configure\n\
+\    You might also have to install some version of the Cabal to do this:\n\
+\        $ cabal install Cabal\n\
+\\n" (sver ver) (sver ver)
+
+sver = showVersion
+
+chErrorMessage (ChProcess fn exe args rv) =
+    concat [fn, ": ", exe, " "
+           , intercalate " " (map show args)
+           , " (exit " ++ show rv ++ ")"]
+
+
+chErrorSuggestions (ChErrorSetupConfigHeader cfgf) = [ChReconfigure]
+chErrorSuggestions (ChErrorGhcVersion lbiVer exeVer) = [ChReconfigure]
+chErrorSuggestions (ChErrorInstallCabalLibrary ver) = concat $
+  [ [ ChReconfigure ]
+  , ChInstallCabalLibrary ChPrivate (ChCVExactVersion ver)
+  , map reconfigureAfter $ concat [
+        [ ChUpdateCabalInstall (ChCVExactVersion ver) ]
+      , map buildTypeSimple [
+          ChUpdateCabalInstall ChCVAnyAvailableVersion
+        , installCabalThen (ChCVSameMajorVersion ver) ChUpdateCabalInstall
+        , installCabalThen (ChCVLaterThanOrEqual ver) ChUpdateCabalInstall
+        ]
+      ]
+  , map buildTypeCustom $
+      [ installCabalThen (ChCVSameMajorVersion ver) ChReconfigure
+      , installCabalThen (ChCVLaterThanOrEqual ver) ChReconfigure
+      ]
+  ]
+ where
+   buildTypeSimple = ChSugConditional (ChBuildType Simple)
+   buildTypeCustom = ChSugConditional (ChBuildType Custom)
+   cabalLibAvailable = ChSugConditional ChCabalLibraryNotAvailable
+   installCabalThen v th = ChSugSequence [
+                            ChInstallCabalLibrary ChUserPackageDb v
+                           , th v
+                           ]
+   reconfigureAfter s = ChSugSequence [s, ChReconfigure]
+
+chErrorSuggestions _ = []
+
+
+chExecuteSuggestion :: Programs -> ChSuggestion -> Maybe (ExceptT String IO ())
+chExecuteSuggestion opts (ChUpdateCabalInstall cabalVer) = Nothing
+chExecuteSuggestion opts ChReconfigure = Just $ fmap Right $
+  cabalClean opts >> cabalConfigure opts
+chExecuteSuggestion opts (ChInstallCabalLibrary loc cabalVer) = Just $ do
+  installCabal opts loc cabalVer
+chExecuteSuggestion opts (ChSugConditional cond sug) = Just $ do
+    b <- chEvalCond cond
+    when b $ chExecuteSuggestion opts sug
+chExecuteSuggestion opts (ChSugSequence sugs) =
+    Just $ mapM_ (chExecuteSuggestion opts) sugs
+
+
+cabalClean opts =
+  cabal opts ["clean"]
+
+cabalConfigure opts = do
+  cabal opts $ (cabalProgArgs opts) ++ ["configure"]
+
+cabalInstall opts mbindir = do
+  cabal opts $ (cabalProgArgs opts) ++ ["install"]
+
+cabalProgArgs opts = [ "--with-ghc=" ++ ghcProgram opts ]
+                  ++ [ "--with-ghc-pkg=" ++ ghcPkgProgram opts
+                     | ghcPkgProgram opts /= ghcPkgProgram defaultOptions
+                     ]
+
+cabal = cabal' Nothing
+cabal' mcwd opts args =
+    callProcessStderr mcwd (cabalProgram opts) $ progArgs ++ args
+
+
+installCabal :: Options -> ChLocation -> Version -> IO FilePath
+installCabal opts loc ver = do
+  appdir <- appDataDir
+  let sver = showVersion ver
+
+  notify $ ChInstallingCabalLibrary loc ver
+
+  db <- createPkgDb opts ver
+  cabal' (Just "/") opts $
+    packageDbArgs loc ++ [ "-v0", "install", "Cabal-"++(sver ver) ]
+
+  hPutStrLn stderr "done"
+  return db
+
+ where
+  packageDbArgs ChPrivate = [ "--package-db=clear"
+                            , "--package-db=global"
+                            , "--package-db=" ++ db
+                            , "--prefix=" ++ db </> "prefix"
+                            ]
+  packageDbArgs ChUserPackageDb = [ "--package-db=global"
+                                  , "--package-db=user"
+                                  ]
+
+
+cabalInfoMessage (ChInstallingCabalLibrary ChPrivate ver) = unlines [
+ "Installing a private copy of Cabal, this might take a while but will only \
+ \happen once per Cabal version.",
+ "",
+ "If you want to avoid this automatic installation altogether install \
+ \version %s of Cabal manually (into your user or global package-db):",
+ "    $ cabal install Cabal %s",
+ "",
+ "Building Cabal-%s..."
+ ]
+
+cabalInfoMessage (ChInstallingCabalLibrary ChUserPackageDb ver) = unlines [
+ "Installing Cabal into your user package database, this might take a while.",
+ "",
+ "If you want to avoid this automatic installation altogether install \
+ \version %s of Cabal manually (into your user or global package-db):",
+ "    $ cabal install Cabal %s",
+ "",
+ "Building Cabal-%s..."
+ ]
+
+
+chCabalVersionToConstraint (ChCVExactVersion v) =
+    Just $ "Cabal == " ++ showVersion v
+chCabalVersionToConstraint (ChCVSameMajorVersion v) =
+    Just $ "Cabal == " ++ showVersion (majorVer v) ++ ".*"
+chCabalVersionToConstraint (ChCVLaterThanOrEqual v) =
+    Just $ "Cabal >= " ++ showVersion v
+chCabalVersionToConstraint ChCVAnyAvailableVersion =
+    Nothing
